@@ -1,107 +1,186 @@
 import geopandas as gpd
-from scipy.spatial import cKDTree
-import numpy as np
 import pandas as pd
-
-# 📁 데이터 불러오기
-gdf_food = gpd.read_file(r"C:/Users/admin/Desktop/식품사막프로젝트/1지도프로젝트/식품점좌표/식품점노드.shp")
-gdf_nodes = gpd.read_file(r"C:/Users/admin/Desktop/식품사막프로젝트/1지도프로젝트/shapefiles_package.gpkg", layer='nodes')
-
-# 좌표계 일치
-if gdf_food.crs != gdf_nodes.crs:
-    gdf_food = gdf_food.to_crs(gdf_nodes.crs)
-
-# 최근접 노드 찾기 (식품점 기준)
-node_coords = np.array(list(zip(gdf_nodes.geometry.x, gdf_nodes.geometry.y)))
-food_coords = np.array(list(zip(gdf_food.geometry.x, gdf_food.geometry.y)))
-tree = cKDTree(node_coords)
-distances, indices = tree.query(food_coords, k=1)
-
-# 식품점별 최근접 노드 인덱스 및 거리 추가
-gdf_food = gdf_food.reset_index(drop=True)
-gdf_food['nearest_node_id'] = gdf_nodes.iloc[indices].index
-gdf_food['distance_to_node'] = distances
-
-# 노드 데이터에 'node_id' 추가
-gdf_nodes = gdf_nodes.reset_index().rename(columns={'index': 'node_id'})
-
-# 🏷️ 노드 기준으로 merge (노드 데이터에 식품점 정보 결합)
-merged_df = gdf_nodes.merge(
-    gdf_food,
-    left_on='node_id', right_on='nearest_node_id',
-    how='left',  # 노드 기준으로 결합 → 식품점 없는 노드도 포함
-    suffixes=('_node', '_food')
-)
-
-# geometry 처리: 노드 geometry 유지
-if 'geometry_food' in merged_df.columns:
-    merged_df = merged_df.drop(columns=['geometry_food'])
-if 'geometry_node' in merged_df.columns:
-    merged_df = merged_df.rename(columns={'geometry_node': 'geometry'})
-
-# GeoDataFrame 생성
-merged_gdf = gpd.GeoDataFrame(merged_df, geometry='geometry', crs=gdf_nodes.crs)
-
-# 저장 (GeoPackage: 컬럼 제한 없음, 여러 geometry 타입 지원)
-output_path = r"C:/Users/admin/Desktop/식품사막프로젝트/1지도프로젝트/노드식품점결합/노드_식품점1N결합.gpkg"
-merged_gdf.to_file(output_path, layer='merged', driver='GPKG')
-
-print(f"✅ GPKG로 저장 완료: {output_path}")
-
-
-
-
-
-import geopandas as gpd
 import numpy as np
-import pandas as pd
+from shapely.geometry import Point
 from scipy.spatial import cKDTree
+import networkx as nx
+import os
 
-# 📁 데이터 불러오기
-gdf_food = gpd.read_file(r"C:/Users/admin/Desktop/식품사막프로젝트/1지도프로젝트/식품점좌표/식품점좌표.shp")
-gdf_nodes = gpd.read_file(r"C:/Users/admin/Desktop/식품사막프로젝트/1지도프로젝트/shapefiles_package.gpkg", layer='nodes')
+# ────────────────────────────────────────
+# 📁 1. 데이터 불러오기
+# ────────────────────────────────────────
+# 링크와 노드
+gpkg_path = r"C:/Users/admin/Desktop/식품사막프로젝트/1지도프로젝트/shapefiles_package.gpkg"
+gdf_links = gpd.read_file(gpkg_path, layer='links_with_adj')
+gdf_nodes = gpd.read_file(r"C:\Users\admin\Desktop\식품사막프로젝트\1지도프로젝트\노드식품점결합\노드_식품점1N결합.gpkg")
 
-# 좌표계 일치
-if gdf_food.crs != gdf_nodes.crs:
-    gdf_food = gdf_food.to_crs(gdf_nodes.crs)
+# 인구격자 (강원 + 경기)
+pop_paths = [
+    r"C:/Users/admin/Desktop/식품사막프로젝트/1지도프로젝트/강원인구격자",
+    r"C:/Users/admin/Desktop/식품사막프로젝트/1지도프로젝트/경기인구격자"
+]
+pop_gdfs = []
 
-# 인덱스 고정
-gdf_nodes = gdf_nodes.reset_index(drop=True)
-gdf_nodes['node_id'] = gdf_nodes.index
+for path in pop_paths:
+    gdf_pop = gpd.read_file(path)
+    gdf_pop = gdf_pop[gdf_pop.columns[[0, 1, -1]]]  # id, 인구, geometry
+    gdf_pop.columns = ['id', 'pop', 'geometry']
+    gdf_pop['centroid'] = gdf_pop.geometry.centroid
+    pop_gdfs.append(gdf_pop)
 
-# KDTree로 최근접 노드 계산
+gdf_pop_all = pd.concat(pop_gdfs, ignore_index=True)
+gdf_pop_all = gpd.GeoDataFrame(gdf_pop_all, geometry='centroid', crs=gdf_pop_all.crs)
+
+# ────────────────────────────────────────
+# 📍 2. 좌표계 통일
+# ────────────────────────────────────────
+if gdf_nodes.crs != gdf_pop_all.crs:
+    gdf_pop_all = gdf_pop_all.to_crs(gdf_nodes.crs)
+if gdf_links.crs != gdf_nodes.crs:
+    gdf_links = gdf_links.to_crs(gdf_nodes.crs)
+
+# ────────────────────────────────────────
+# 📌 3. 인구 → 노드 매핑 (1:N → 합산)
+# ────────────────────────────────────────
+# 1. 인구 0 이상 필터링
+gdf_pop_all['pop'] = pd.to_numeric(gdf_pop_all['pop'], errors='coerce').fillna(0)
+gdf_pop_valid = gdf_pop_all[gdf_pop_all['pop'] > 0].copy()
+
+# 2. 좌표 → 최근접 노드 찾기
+pop_coords = np.array(list(zip(gdf_pop_valid.geometry.x, gdf_pop_valid.geometry.y)))
 node_coords = np.array(list(zip(gdf_nodes.geometry.x, gdf_nodes.geometry.y)))
-food_coords = np.array(list(zip(gdf_food.geometry.x, gdf_food.geometry.y)))
+
 tree = cKDTree(node_coords)
-distances, indices = tree.query(food_coords, k=1)
+_, indices = tree.query(pop_coords, k=1)
+nearest_node_ids = gdf_nodes.iloc[indices].index
 
-# 결과 추가
-gdf_food = gdf_food.reset_index(drop=True)
-gdf_food['nearest_node_id'] = indices
-gdf_food['distance_to_node'] = distances
+# 3. 전체에 NaN 초기화
+gdf_pop_all['nearest_node'] = np.nan
 
-# 병합
-merged_df = gdf_nodes.merge(
-    gdf_food,
-    left_on='node_id', right_on='nearest_node_id',
-    how='left',
-    suffixes=('_node', '_food')
-)
+# 4. 유효 인덱스에만 최근접 노드값 대입 (index 맞춰서!)
+gdf_pop_all.loc[gdf_pop_valid.index, 'nearest_node'] = nearest_node_ids.values
 
-# geometry 처리
-if 'geometry_food' in merged_df.columns:
-    merged_df = merged_df.drop(columns=['geometry_food'])
-if 'geometry_node' in merged_df.columns:
-    merged_df = merged_df.rename(columns={'geometry_node': 'geometry'})
 
-# GeoDataFrame 변환
-merged_gdf = gpd.GeoDataFrame(merged_df, geometry='geometry', crs=gdf_nodes.crs)
 
-# 저장
-output_path = "노드_식품점1N결합.gpkg"
-merged_gdf.to_file(output_path, layer='노드_식품점결합', driver='GPKG')
+
+tree = cKDTree(node_coords)
+_, indices = tree.query(pop_coords, k=1)
+nearest_node_ids = gdf_nodes.iloc[indices].index
+
+# 노드 인구 합산
+# 예: pop > 0인 행에만 최근접 노드 매핑
+gdf_pop_all.loc[gdf_pop_valid.index, 'nearest_node'] = nearest_node_ids.values
+pop_by_node = gdf_pop_all.groupby('nearest_node')['pop'].sum()
+gdf_nodes['pop'] = gdf_nodes.index.map(pop_by_node).fillna(0)
+gdf_nodes['pop'] = pd.to_numeric(gdf_nodes['pop'], errors='coerce').fillna(0)
+
+# ────────────────────────────────────────
+# 🛒 4. 대규모점포/슈퍼마켓 노드 필터링
+# ────────────────────────────────────────
+target_nodes = gdf_nodes[gdf_nodes['상권업종소'].isin(['대규모점포', '슈퍼마켓'])]
+
+target_node_ids = target_nodes['NF_ID'].tolist()
+
+# ────────────────────────────────────────
+# 🕸️ 5. 링크로 그래프 생성
+# ────────────────────────────────────────
+from shapely.geometry import LineString
+
+
+
+G = nx.DiGraph()  # 방향 있는 그래프
+
+for idx, row in gdf_links.iterrows():
+    try:
+        start = row['BNODE_NFID']
+        end = row['ENODE_NFID']
+        dist = row.geometry.length
+        osps = row['OSPS_SE']  # 일방 or 양방
+        
+        if dist >= 0:
+            if osps == 'OWI001':  # 일방통행
+                G.add_edge(start, end, weight=dist)
+            else:  # 양방통행
+                G.add_edge(start, end, weight=dist)
+                G.add_edge(end, start, weight=dist)
+    except:
+        continue
+
+
+# ────────────────────────────────────────
+# 🧮 6. 최단 거리 계산
+# ────────────────────────────────────────
+distances = nx.multi_source_dijkstra_path_length(G, target_node_ids, weight='weight')
+
+# 2) gdf_nodes의 NF_ID 순서에 맞춰 최단거리 리스트 생성
+#    distances 사전에 없는 노드는 np.nan 처리
+min_distances = [
+    distances.get(node_id, np.nan)
+    for node_id in gdf_nodes['NF_ID']
+]
+
+
+gdf_nodes['min_dist_to_store'] = min_distances
+
+# pop과 거리 둘 다 숫자로 변환
+gdf_nodes['pop'] = pd.to_numeric(gdf_nodes['pop'], errors='coerce')
+
+# 곱셈 가능할 때만 계산, 그 외는 NaN
+gdf_nodes['pop_dist'] = gdf_nodes['pop'] * gdf_nodes['min_dist_to_store']
+
+
+# 예: gdf_nodes의 'pop_dist' 값을 인구격자에 할당
+gdf_pop_all['pop_dist'] = gdf_pop_all['nearest_node'].map(gdf_nodes['pop_dist'])
+gdf_pop_all['pop_dist'] = gdf_pop_all['pop_dist'].fillna(0)
+
+
+# 예: 노드의 인구 값도 추가 가능
+gdf_pop_all['node_pop'] = gdf_pop_all['nearest_node'].map(gdf_nodes['pop'])
+gdf_pop_all['pop'] = pd.to_numeric(gdf_pop_all['pop'], errors='coerce')
+
+# 로그 변환: log(1 + x) 형태로 0도 안정적으로 처리
+gdf_pop_all['log_pop_dist'] = np.log1p(gdf_pop_all['pop_dist'])
+
+gdf_pop_all['min_dist_to_store'] = gdf_pop_all['nearest_node'].map(gdf_nodes['min_dist_to_store']).fillna(0)
+
+# ────────────────────────────────────────
+# 💾 7. 저장
+# ────────────────────────────────────────
+output_path = r"C:/Users/admin/Desktop/식품사막프로젝트/1지도프로젝트/노드_최단거리_결과.gpkg"
+gdf_nodes.to_file(output_path, layer="nodes", driver="GPKG")
+print(f"✅ 저장 완료: {output_path}")
+
+
+gdf_save = gdf_pop_all.drop(columns=['centroid'])
+
+output_path = r"C:/Users/admin/Desktop/식품사막프로젝트/1지도프로젝트/인구격자_최단거리.gpkg"
+gdf_save.to_file(output_path, layer="popgrid", driver="GPKG")
 
 print(f"✅ 저장 완료: {output_path}")
+
+
+
+# 대규모점포 또는 슈퍼마켓 필터링
+target_nodes = gdf_nodes[gdf_nodes['상권업종소'].isin(['대규모점포', '슈퍼마켓'])]
+output_path = r"C:/Users/admin/Desktop/식품사막프로젝트/1지도프로젝트/노드_대규모점포_슈퍼마켓.gpkg"
+target_nodes.to_file(output_path, layer="target_nodes", driver="GPKG")
+
+
+
+
+
+
+
+
+
+# 최근접 노드 ID 목록 (중복 제거)
+nearest_node_ids = gdf_pop_all['nearest_node'].dropna().unique()
+
+# gdf_nodes에서 해당 노드만 필터링
+nearest_node_gdf = gdf_nodes[gdf_nodes.index.isin(nearest_node_ids)]
+
+output_path = r"C:/Users/admin/Desktop/식품사막프로젝트/1지도프로젝트/노드_최근접인구.gpkg"
+nearest_node_gdf.to_file(output_path, layer="nearest_nodes", driver="GPKG")
 
 
 
