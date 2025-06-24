@@ -72,7 +72,7 @@ def ewma_shrink_cov(returns_df, lam=0.94, shrink_lambda=0.0):
                                      columns=returns_df.columns))
     return cov_list
 
-def optimize_weights(mu, cov, objective='sharpe', ridge=1e-3):
+def optimize_weights(mu, cov, objective='sharpe', ridge=1e-3, sum_to_one=True):
     mu_arr = mu.values
     cov_mat = cov.values
     N = len(mu_arr)
@@ -94,12 +94,19 @@ def optimize_weights(mu, cov, objective='sharpe', ridge=1e-3):
     else:
         raise ValueError("objective는 'sharpe' 또는 'kelly'만 가능합니다.")
 
-    bounds = [(0, 1)] * N
-    cons = ({'type': 'eq', 'fun': lambda w: w.sum() - 1},)
+    bounds = [(0, 1)] * N if sum_to_one else [(0, None)] * N
+
+    # ✅ 비중합 = 1 제약 여부
+    if sum_to_one:
+        cons = ({'type': 'eq', 'fun': lambda w: w.sum() - 1},)
+    else:
+        cons = ()
+
     w0 = np.ones(N) / N
 
     res = minimize(obj, w0, method='SLSQP', bounds=bounds, constraints=cons)
     return pd.Series(res.x if res.success else np.full(N, np.nan), index=mu.index)
+
 
 def rolling_portfolio_weights(mu_df, cov_list, objective='sharpe', ridge=1e-3):
     weights = []
