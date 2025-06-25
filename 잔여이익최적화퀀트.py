@@ -6,6 +6,7 @@ from scipy.optimize import root_scalar
 from pykrx import stock, bond
 from datetime import datetime
 from scipy.optimize import minimize
+import re
 
 
 
@@ -392,8 +393,15 @@ def get_annualized_cov_matrix(ticker_list, start="2023-01-01", end=None, span=20
 
 
 
-tickers = ['091160.KS', '091180.KS']
-cov_matrix = get_annualized_cov_matrix(tickers, start="2023-01-01", span=20)
+ktickers = ['091160.KS', '091180.KS']
+us_etfs = ['381170.KS']
+cn_etfs = ['371460.KS']
+
+
+all_ticker = ktickers + us_etfs + cn_etfs
+
+
+cov_matrix = get_annualized_cov_matrix(all_ticker, start="2023-01-01", span=20)
 
 print("📊 연율화 공분산 행렬 (EWMA 기반):")
 print(cov_matrix)
@@ -402,19 +410,146 @@ print(cov_matrix)
 
 
 
-# 예: 기대수익률 (mu) 정의 - 이건 직접 정한 값이거나 과거 수익률 기반일 수 있음
-mu = pd.Series({
-    '091160.KS': 0.10252800177954699,  
-    '091180.KS': 0.16365296324183476    
-})
 
 
-mu = mu-rf
+
+
+
+
+
+
+
+
+
+import pandas_datareader.data as web
+import datetime
+
+# 오늘 날짜 지정 (혹시 데이터가 없을 경우 대비해서 하루 전까지 fallback 가능)
+endus = datetime.datetime.today()
+startus = endus - datetime.timedelta(days=7)  # 최근 일주일
+
+# FRED에서 10년 국채 수익률 'DGS10' 불러오기
+frd = web.DataReader('DGS10', 'fred', startus, endus)
+
+# 결측 제거 + 가장 최근 값 추출
+frd = frd.dropna()
+usrf = frd.iloc[-1, 0] / 100  # 퍼센트 → 소수로 변환
+
+
+
+
+text = """Implied ERP in previous month = 4.41% (Trailing 12 month, with adjusted payout); \
+4.58% (Trailing 12 month cash yield); 5.86% (Average CF yield last 10 years); \
+4.34% (Net cash yield); 4.03% (Normalized Earnings & Payout)"""
+
+# 수치만 추출 후 소수로 변환
+pattern = r"([\d.]+)%\s*\(Trailing 12 month cash yield\)"
+match = re.search(pattern, text)
+
+if match:
+    userp = float(match.group(1)) / 100
+    print(userp)
+else:
+    print("값을 찾을 수 없습니다.")
+
+
+
+
+chinaerp = 5.27 / 100
+
+
+
+
+from datetime import datetime, timedelta
+import pandas_datareader.data as web
+
+# 1. 티커 설정
+exticker = us_etfs + cn_etfs
+
+# 벤치마크 매핑
+benchmark_map = {etf: '^GSPC' for etf in us_etfs}
+benchmark_map.update({etf: '000300.SS' for etf in cn_etfs})
+
+# 2. 기간 설정: 최근 1년
+ex_end = datetime.today()
+ex_start = ex_end - timedelta(days=365)
+
+# 3. 가격 데이터 다운로드
+all_tickers = exticker + list(set(benchmark_map.values()))
+data = yf.download(all_tickers, start=ex_start, end=ex_end)['Close']
+
+# 4. 로그수익률 계산 (일간)
+log_returns = np.log(data).diff().dropna()
+
+# 5. ERP 및 usrf 설정
+userp = 4.58 / 100
+chinaerp = 5.27 / 100
+
+# 미국 무위험 수익률: FRED DGS10
+try:
+    rf_df = web.DataReader('DGS10', 'fred', ex_end - timedelta(days=7), ex_end)
+    rf_df = rf_df.dropna()
+    usrf = rf_df.iloc[-1, 0] / 100
+except:
+    usrf = 0.045  # fallback
+
+# 6. ETF별 로그수익률 기반 베타 및 기대수익률 계산
+exmu_result = []
+for etf in exticker:
+    mkt = benchmark_map[etf]
+    etf_ret = log_returns[etf]
+    mkt_ret = log_returns[mkt]
+
+    aligned = pd.concat([etf_ret, mkt_ret], axis=1).dropna()
+    x = aligned.iloc[:, 1]  # 시장
+    y = aligned.iloc[:, 0]  # ETF
+
+    cov = np.cov(y, x)[0, 1]
+    var = np.var(x)
+    beta = cov / var
+
+    erp = userp if mkt == '^GSPC' else chinaerp
+    expected_ret = beta * erp + (1 - beta) * usrf
+
+    exmu_result.append({
+        'ETF': etf,
+        'Market': mkt,
+        'Beta (1Y Daily Log)': round(beta, 4),
+        'Expected Return (%)': round(expected_ret * 100, 2)
+    })
+
+# 7. 결과 정리
+exmu_df = pd.DataFrame(exmu_result)
+print(exmu_df)
+
+
+
+
+# 1. 한국 ETF 기대수익률 (직접 수익률 - rf)
+kr_mu = pd.Series(etf_returns)  # {'091160': val, ...}
+kr_mu = kr_mu - usrf            # 동일한 무위험수익률 사용
+
+# 2. 외국 ETF 기대수익률 (exmu_df의 값, 이미 rf 포함됨)
+foreign_mu = exmu_df.set_index('ETF')['Expected Return (%)'] / 100  # 소수로
+
+# 3. 티커명 통일
+kr_mu.index = [f"{code}.KS" for code in kr_mu.index]
+
+# 4. 통합
+mu = pd.concat([kr_mu, foreign_mu])
+
+weight_list = [1.0, 1.0, 1.0, 1.0]
+
+# 리스트 곱하기 (순서 일치해야 함)
+adjusted_mu = mu * weight_list
+
+
+print("통합된 기대수익률 (mu):")
+print(mu)
 
 
 # 켈리 최적 포트폴리오 비중 계산
-kelly_weights = optimize_weights(mu, cov_matrix, objective='kelly', ridge= 0.1, sum_to_one= False)
+kelly_weights = optimize_weights(adjusted_mu, cov_matrix, objective='kelly', ridge= 0.1, sum_to_one= False)
 
-print("📈 켈리 기준 최적 투자 비중:")
+print("켈리 기준 최적 투자 비중:")
 print(kelly_weights)
-
