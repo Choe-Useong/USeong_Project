@@ -8,6 +8,37 @@ from datetime import datetime
 from scipy.optimize import minimize
 import re
 
+us_etfs = ['133690.KS',  # TIGER 미국나스닥100
+           '381180.KS',  # TIGER 미국필라델피아반도체나스닥
+           '182480.KS',  # TIGER 미국MSCI리츠(합성 H)
+           ]
+cn_etfs = ['192090.KS']
+etf_list = ['462010.KS',  # TIGER 2차전지소재Fn
+            '396500.KS',  # KODEX 반도체 탑10
+            '091180.KS',  # KODEX 자동차
+            '227560.KS',  # TIGER 200 생활소비재
+            ]
+comm_etf = ['411060.KS',  # ACE KRX금현물
+            ]
+ktickers = etf_list
+all_ticker = ktickers + us_etfs + cn_etfs + comm_etf
+
+
+
+
+etf_name_map = {
+    '133690.KS': 'TIGER 미국나스닥100',
+    '381180.KS': 'TIGER 미국필라델피아반도체',
+    '182480.KS': 'TIGER 미국MSCI리츠(합성 H)',
+    '192090.KS': 'KODEX 차이나CSI300',
+    '462010.KS': 'ACE 2차전지 테마포커스',
+    '396500.KS': 'KODEX 반도체 탑10',
+    '091180.KS': 'KODEX 자동차',
+    '227560.KS': 'TIGER 200 생활소비재',
+    '411060.KS': 'ACE KRX금현물',
+}
+
+
 
 
 data = pd.read_excel(r"C:\Users\admin\Desktop\갭스.xlsx", header= None)
@@ -145,11 +176,52 @@ def compute_daily_beta_1y(sym_code, market_code):
 
 
 
-# 시장 시가총액 (단위: 원)
-market_caps = {
-    '코스피': 2538235151 * 1_000_000,
-    '코스닥': 414507549 * 1_000_000
+
+
+
+# 기준일 값 (수동 한 번만)
+base_date = '2025-06-26'
+base_index = {
+    '코스피': 3079.56,
+    '코스닥': 787.95
 }
+base_market_caps = {
+    '코스피': 2519593952 * 1_000_000,
+    '코스닥': 407828275 * 1_000_000
+}
+
+# 오늘 시총 계산 함수 (정상작동 버전)
+def get_current_market_caps():
+    ticker_map = {'코스피': '^KS11', '코스닥': '^KQ11'}
+    market_caps_today = {}
+
+    for market, ticker in ticker_map.items():
+        hist = yf.download(ticker, start=base_date, progress=False, auto_adjust=False)[['Close']]
+        current_price = hist['Close'].iloc[-1].item()
+        ratio = current_price / base_index[market]
+        market_caps_today[market] = base_market_caps[market] * ratio
+
+    return market_caps_today
+
+# 사용 예시
+market_caps = get_current_market_caps()
+print(market_caps)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -200,10 +272,9 @@ print(market_df)
 today = datetime.today().strftime('%Y%m%d')
 
 # 오늘 날짜로 데이터 요청
-rf = bond.get_otc_treasury_yields(today).loc['국고채 10년','수익률'] / 100
+rf = bond.get_otc_treasury_yields(today).loc['국고채 3년','수익률'] / 100
 
-# ETF 리스트 지정
-etf_list = ['091160', '091180']  # 원하는 ETF 코드를 여기에 추가
+
 
 # 결과 저장용
 merged_dict = {}
@@ -214,8 +285,8 @@ for etf_code in etf_list:
 
     try:
         # 1. ETF 구성 정보 불러오기
-        df = stock.get_etf_portfolio_deposit_file(etf_code).reset_index()
-        df['심볼A'] = 'A' + df['티커']
+        df = stock.get_etf_portfolio_deposit_file(etf_code.split('.')[0]).reset_index()
+        df['심볼A'] = 'A' + df['티커'].str.replace('.KS', '', regex=False)
         df['비중'] = pd.to_numeric(df['비중']) / 100
         df = df[['심볼A', '비중']]
 
@@ -354,14 +425,11 @@ def optimize_weights(mu, cov, objective='sharpe', ridge=1e-3, sum_to_one=True):
 
 
 
-
-
-def get_annualized_cov_matrix(ticker_list, start="2023-01-01", end=None, span=20):
+def get_annualized_cov_matrix(ticker_list, start="2023-01-01", end=None, lambda_=0.94):
     """
-    EWMA 기반 연율화 공분산 행렬 계산 함수
-    - ticker_list: 티커 리스트 (예: ['SPY', 'QQQ', 'TLT'])
-    - span: EWMA 가중치
-    - start, end: 기간 설정
+    감쇠계수 기반 EWMA 연율화 공분산 행렬 계산
+    - ticker_list: 티커 리스트
+    - lambda_: 감쇠계수 λ (예: 0.94)
     """
     if end is None:
         end = pd.Timestamp.today().strftime('%Y-%m-%d')
@@ -377,8 +445,10 @@ def get_annualized_cov_matrix(ticker_list, start="2023-01-01", end=None, span=20
 
     returns = np.log(price_df / price_df.shift(1)).dropna()
 
-    # EWMA 공분산 계산
-    ewm_cov = returns.ewm(span=span).cov(pairwise=True)
+    alpha = 1 - lambda_  # EWMA의 α = 1 - λ
+
+    # 감쇠계수 기반 EWMA 공분산
+    ewm_cov = returns.ewm(alpha=alpha).cov(pairwise=True)
 
     # 마지막 날짜의 공분산 행렬만 추출
     last_date = ewm_cov.index.get_level_values(0).max()
@@ -393,15 +463,9 @@ def get_annualized_cov_matrix(ticker_list, start="2023-01-01", end=None, span=20
 
 
 
-ktickers = ['091160.KS', '091180.KS']
-us_etfs = ['381170.KS']
-cn_etfs = ['371460.KS']
 
 
-all_ticker = ktickers + us_etfs + cn_etfs
-
-
-cov_matrix = get_annualized_cov_matrix(all_ticker, start="2023-01-01", span=20)
+cov_matrix = get_annualized_cov_matrix(all_ticker, start="2023-01-01")
 
 print("📊 연율화 공분산 행렬 (EWMA 기반):")
 print(cov_matrix)
@@ -462,94 +526,163 @@ chinaerp = 5.27 / 100
 
 from datetime import datetime, timedelta
 import pandas_datareader.data as web
+import statsmodels.api as sm
 
-# 1. 티커 설정
 exticker = us_etfs + cn_etfs
 
-# 벤치마크 매핑
-benchmark_map = {etf: '^GSPC' for etf in us_etfs}
+# 벤치마크 및 환율, ERP 매핑 (사용자 명칭 유지)
+benchmark_map = {etf: '449180.KS' for etf in us_etfs}
 benchmark_map.update({etf: '000300.SS' for etf in cn_etfs})
 
-# 2. 기간 설정: 최근 1년
+fx_ticker_map = {etf: 'KRW=X' for etf in us_etfs}
+fx_ticker_map.update({etf: 'CNY=X' for etf in cn_etfs})
+
+erp_map = {etf: 4.58 / 100 for etf in us_etfs}
+erp_map.update({etf: 5.27 / 100 for etf in cn_etfs})
+
+# 기간 설정
 ex_end = datetime.today()
 ex_start = ex_end - timedelta(days=365)
 
-# 3. 가격 데이터 다운로드
-all_tickers = exticker + list(set(benchmark_map.values()))
-data = yf.download(all_tickers, start=ex_start, end=ex_end)['Close']
+# 종목 전체 수집 대상
+combined_ticker_universe = list(set(exticker + list(benchmark_map.values()) + list(fx_ticker_map.values())))
 
-# 4. 로그수익률 계산 (일간)
-log_returns = np.log(data).diff().dropna()
+# 가격 데이터 수집
+price_matrix_for_beta_estimation = yf.download(combined_ticker_universe, start=ex_start, end=ex_end)['Close']
 
-# 5. ERP 및 usrf 설정
-userp = 4.58 / 100
-chinaerp = 5.27 / 100
+# 로그수익률 계산
+log_return_for_exmu_beta = np.log(price_matrix_for_beta_estimation).diff().dropna()
 
-# 미국 무위험 수익률: FRED DGS10
+# 무위험수익률
 try:
-    rf_df = web.DataReader('DGS10', 'fred', ex_end - timedelta(days=7), ex_end)
-    rf_df = rf_df.dropna()
-    usrf = rf_df.iloc[-1, 0] / 100
+    t10y_price_table = web.DataReader('DGS10', 'fred', ex_end - timedelta(days=7), ex_end)
+    t10y_price_table = t10y_price_table.dropna()
+    usrf = t10y_price_table.iloc[-1, 0] / 100
 except:
     usrf = 0.045  # fallback
 
-# 6. ETF별 로그수익률 기반 베타 및 기대수익률 계산
+# 결과 저장 테이블
 exmu_result = []
+
+# ETF별 베타 계산
 for etf in exticker:
-    mkt = benchmark_map[etf]
-    etf_ret = log_returns[etf]
-    mkt_ret = log_returns[mkt]
+    try:
+        market_index_symbol = benchmark_map[etf]
+        fx_ticker = fx_ticker_map[etf]
+        erp_value = erp_map[etf]
 
-    aligned = pd.concat([etf_ret, mkt_ret], axis=1).dropna()
-    x = aligned.iloc[:, 1]  # 시장
-    y = aligned.iloc[:, 0]  # ETF
+        regression_input_frame = pd.concat([
+            log_return_for_exmu_beta[etf],
+            log_return_for_exmu_beta[market_index_symbol],
+            log_return_for_exmu_beta[fx_ticker]
+        ], axis=1).dropna()
+        regression_input_frame.columns = ['etf_return', 'market_return', 'fx_return']
 
-    cov = np.cov(y, x)[0, 1]
-    var = np.var(x)
-    beta = cov / var
+        regression_design_matrix = sm.add_constant(regression_input_frame[['market_return', 'fx_return']])
+        regression_target_vector = regression_input_frame['etf_return']
 
-    erp = userp if mkt == '^GSPC' else chinaerp
-    expected_ret = beta * erp + (1 - beta) * usrf
+        fitted_ols_model = sm.OLS(regression_target_vector, regression_design_matrix).fit()
+        market_beta_fx_adjusted = fitted_ols_model.params['market_return']
 
-    exmu_result.append({
-        'ETF': etf,
-        'Market': mkt,
-        'Beta (1Y Daily Log)': round(beta, 4),
-        'Expected Return (%)': round(expected_ret * 100, 2)
-    })
+        expected_excess_return = market_beta_fx_adjusted * erp_value + (1 - market_beta_fx_adjusted) * usrf
 
-# 7. 결과 정리
+        exmu_result.append({
+            'ETF': etf,
+            'Market': market_index_symbol,
+            'Beta (FX-controlled)': round(market_beta_fx_adjusted, 4),
+            'Expected Return (%)': round(expected_excess_return * 100, 2)
+        })
+
+    except Exception as e:
+        print(f"⚠️ {etf} 처리 실패: {e}")
+
+# 결과 출력
 exmu_df = pd.DataFrame(exmu_result)
-print(exmu_df)
+exmu_df['Expected Return (%)'] = exmu_df['Expected Return (%)'] + (usrf*100) - (rf*100)
 
+print(exmu_df)
 
 
 
 # 1. 한국 ETF 기대수익률 (직접 수익률 - rf)
 kr_mu = pd.Series(etf_returns)  # {'091160': val, ...}
-kr_mu = kr_mu - usrf            # 동일한 무위험수익률 사용
+kr_mu = kr_mu - rf            # 동일한 무위험수익률 사용
 
 # 2. 외국 ETF 기대수익률 (exmu_df의 값, 이미 rf 포함됨)
 foreign_mu = exmu_df.set_index('ETF')['Expected Return (%)'] / 100  # 소수로
 
 # 3. 티커명 통일
-kr_mu.index = [f"{code}.KS" for code in kr_mu.index]
+kr_mu.index = [f"{code}" for code in kr_mu.index]
+
+# ✅ 금 (commodity) 기대수익률 추정 전용 기간 설정
+comm_end_date = datetime.today()
+comm_start_date = comm_end_date - timedelta(days=365 * 15)  # 최대한 길게
+
+# ✅ 데이터 수집
+gld_price = yf.download('GLD', start=comm_start_date, end=comm_end_date, interval='1mo')['Close']
+fx_price = yf.download('KRW=X', start=comm_start_date, end=comm_end_date, interval='1mo')['Close']
+fx_price[fx_price['KRW=X'] <= 1] = fx_price[fx_price['KRW=X'] <= 1]*10000
+
+
+# ✅ 병합 및 정리
+comm_df = pd.concat([gld_price, fx_price], axis=1).dropna()
+comm_df.columns = ['GLD', 'FX']
+
+# ✅ 환노출 금 가격 계산
+comm_df['KRW_GOLD'] = comm_df['GLD'] * comm_df['FX']
+comm_df['log_return'] = np.log(comm_df['KRW_GOLD'] / comm_df['KRW_GOLD'].shift(1))
+comm_df = comm_df.dropna()
+
+# ✅ ARIMA 예측 기반 기대수익률 산출
+model = ARIMA(comm_df['log_return'], order=(1, 0, 1))
+result = model.fit()
+forecast = result.get_forecast(steps=1).predicted_mean  
+
+expected_annual_return = (forecast.mean() * 12) - rf  # 월수익률 → 연환산
+print(f"📈 환노출 금 기대수익률 (ARIMA 기반): {expected_annual_return:.4%}")
+
+# 3. 원자재 ETF 기대수익률 (역사적 평균)
+comm_mu = pd.Series({'411060.KS': expected_annual_return})
 
 # 4. 통합
-mu = pd.concat([kr_mu, foreign_mu])
-
-weight_list = [1.0, 1.0, 1.0, 1.0]
+mu = pd.concat([kr_mu, foreign_mu, comm_mu])
 
 # 리스트 곱하기 (순서 일치해야 함)
-adjusted_mu = mu * weight_list
+adjusted_mu = mu * 1
 
-
-print("통합된 기대수익률 (mu):")
-print(mu)
 
 
 # 켈리 최적 포트폴리오 비중 계산
-kelly_weights = optimize_weights(adjusted_mu, cov_matrix, objective='kelly', ridge= 0.1, sum_to_one= False)
+kelly_weights = optimize_weights(adjusted_mu, cov_matrix, objective='kelly', ridge= 0.1, sum_to_one= False) *0.5
 
-print("켈리 기준 최적 투자 비중:")
-print(kelly_weights)
+
+
+
+
+
+etf_name_map = {
+    '133690.KS': 'TIGER 미국나스닥100',
+    '381180.KS': 'TIGER 미국필라델피아반도체',
+    '182480.KS': 'TIGER 미국MSCI리츠(합성 H)',
+    '192090.KS': 'KODEX 차이나CSI300',
+    '462010.KS': 'TIGER 2차전지소재Fn',
+    '396500.KS': 'KODEX 반도체 탑10',
+    '091180.KS': 'KODEX 자동차',
+    '227560.KS': 'TIGER 200 생활소비재',
+    '411060.KS': 'ACE KRX금현물',
+}
+
+
+
+mu_named = mu.rename(index=etf_name_map)
+kelly_named = kelly_weights.rename(index=etf_name_map)
+
+
+print("📈 기대수익률 (mu):")
+print(mu_named.sort_values(ascending=False).apply(lambda x: f"{x:.2%}"))
+
+print("\n🧮 켈리 최적 비중:")
+print(kelly_named.sort_values(ascending=False).apply(lambda x: f"{x:.2%}"))
+
+
+print(round((1 -kelly_weights.sum())*100,2))
