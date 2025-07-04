@@ -85,44 +85,38 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
             self.reset()
             obs_low = []
             obs_high = []
-            min_demand = torch.min(fixed_net_demand).item()
-            max_demand = torch.max(fixed_net_demand).item()
-            min_dist = float(np.min(dist_matrix))
-            max_dist = float(np.max(dist_matrix))
 
             for _ in range(self.num_nodes):
-                # 수요
-                obs_low.extend([min_demand] * self.num_items)
-                obs_high.extend([max_demand] * self.num_items)
+                # 수요 정규화: [-1.0, 1.0]
+                obs_low.extend([-1.0] * self.num_items)
+                obs_high.extend([1.0] * self.num_items)
 
-                # 현재 위치 (one-hot)
+                # 위치 one-hot: [0.0, 1.0]
                 obs_low.append(0.0)
                 obs_high.append(1.0)
 
-                # 거리
-                obs_low.append(min_dist)
-                obs_high.append(max_dist)
-
-                # 도달 가능 여부
+                # 거리 정규화: [0.0, 1.0]
                 obs_low.append(0.0)
                 obs_high.append(1.0)
 
-            # 차량 적재량
-            max_group_cap = max(group_cap.values())
-            obs_low.extend([0] * self.num_items)
-            obs_high.extend([max_group_cap] * self.num_items)
-
-            # 그룹 잔여 용량
-            for g in sorted(group_cap.keys()):
+                # 도달 가능 여부: [0.0, 1.0]
                 obs_low.append(0.0)
-                obs_high.append(float(group_cap[g]))
+                obs_high.append(1.0)
 
-            # 관측공간 정의
+            # 차량 적재량 (정규화됨): [0.0, 1.0]
+            obs_low.extend([0.0] * self.num_items)
+            obs_high.extend([1.0] * self.num_items)
+
+            # 그룹 잔여 용량 (정규화됨): [0.0, 1.0]
+            obs_low.extend([0.0] * self.num_groups)
+            obs_high.extend([1.0] * self.num_groups)
+
             self.observation_space = Box(
                 low=np.array(obs_low, dtype=np.float32),
                 high=np.array(obs_high, dtype=np.float32),
                 dtype=np.float32
             )
+
 
         def _get_total_unbalance(self):
             # 벡터화: 모든 노드(depot 제외)의 절대값 수요 합 계산
@@ -137,14 +131,15 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
             return self._get_obs(), {}
         
         def _get_obs(self):
-            # 차량 위치 원-핫 인코딩
+        # 차량 위치 원-핫 인코딩
             vehicle_pos_onehot = torch.zeros(self.num_nodes, dtype=torch.float32)
             vehicle_pos_onehot[self.vehicle_pos] = 1.0
 
             # 모든 노드까지의 거리
             distances = self.dist_matrix[self.vehicle_pos].clone()
+            max_dist = self.dist_matrix.max().item()
 
-            # 그룹별 사용량 계산 (벡터화)
+            # 그룹별 사용량 계산
             group_used = torch.zeros(self.num_groups, dtype=torch.int32)
             for g in range(self.num_groups):
                 group_mask = self.group_masks[g]
@@ -153,51 +148,53 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
             # 그룹별 잔여 용량
             group_remaining = self.group_cap_tensor - group_used
 
-            # feasible 계산 (노드별)
+            # 도달 가능 여부
             feasible = torch.zeros(self.num_nodes, dtype=torch.float32)
-            feasible[0] = 1.0  # depot는 항상 도달 가능
+            feasible[0] = 1.0  # depot은 항상 가능
 
             for n in range(1, self.num_nodes):
                 for i in range(self.num_items):
                     net_value = self.net_demand[n, i].item()
                     group_id = self.item_to_group[i].item()
-                    # 픽업 가능 조건: 양수 수요 + 그룹에 여유 공간 있음
                     can_pickup = (net_value > 0) and (group_remaining[group_id] >= 1)
-                    # 배송 가능 조건: 음수 수요 + 차량에 해당 아이템 있음
                     can_deliver = (net_value < 0) and (self.vehicle_capacity[i] >= 1)
-
                     if can_pickup or can_deliver:
                         feasible[n] = 1.0
                         break
 
-            # 관찰 벡터 구성
+            # 관측 벡터 구성
             obs = []
 
-            # 각 노드에 대한 관찰 값 추가
             for i in range(self.num_nodes):
-                # 노드의 아이템별 수요
-                node_demand = self.net_demand[i].float().tolist()
+                # 1. 수요 정규화: 그룹 최대 용량으로
+                raw_demand = self.net_demand[i].float()
+                group_cap_vector = self.group_cap_tensor[self.item_to_group]
+                norm_demand = (raw_demand / group_cap_vector).clamp(-1.0, 1.0)
+                node_demand = norm_demand.tolist()
 
-                # 노드에 차량이 있는지 여부
+                # 2. 위치
                 at_node = vehicle_pos_onehot[i].item()
 
-                # 현재 위치에서 노드까지의 거리
-                node_dist = distances[i].item()
+                # 3. 거리 정규화
+                norm_dist = distances[i].item() / max_dist
 
-                # 노드가 도달 가능한지 여부
+                # 4. 도달 가능 여부
                 node_feasible = feasible[i].item()
 
-                # 노드 관찰 벡터 구성
-                node_obs = node_demand + [at_node, node_dist, node_feasible]
+                node_obs = node_demand + [at_node, norm_dist, node_feasible]
                 obs.extend(node_obs)
 
-            # 차량 적재 상태
-            obs.extend(self.vehicle_capacity.float().tolist())
+            # 5. 차량 적재량 정규화
+            norm_vehicle_capacity = (self.vehicle_capacity.float() / group_cap_vector).clamp(0.0, 1.0)
+            obs.extend(norm_vehicle_capacity.tolist())
 
-            # 그룹별 잔여 적재 가능량
+            # 6. 그룹 잔여 용량 정규화
             for g in sorted(self.group_cap.keys()):
-                obs.append(float(group_remaining[g].item()))
+                norm_remain = float(group_remaining[g].item()) / self.group_cap[g]
+                obs.append(min(norm_remain, 1.0))
+
             return np.array(obs, dtype=np.float32)
+
         
         def step(self, action):
             prev_unbalance = self._get_total_unbalance()
@@ -279,7 +276,7 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
     model = PPO(
         "MlpPolicy",
         train_env,
-        policy_kwargs={"net_arch": [512, 512, 512]},
+        policy_kwargs={"net_arch": [512, 512, 512, 512, 512]},
         verbose=1,
         n_epochs=20,
         device = 'cpu'
@@ -294,7 +291,7 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
     render=False
     )
 
-    model.learn(total_timesteps=100000, 
+    model.learn(total_timesteps=1000000, 
             callback=eval_callback
             )
     
@@ -360,3 +357,12 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
     plt.axis("equal")
     plt.tight_layout()
     plt.show()
+
+
+
+
+
+
+
+
+
