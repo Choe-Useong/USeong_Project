@@ -22,12 +22,12 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
 
     fixed_net_demand = torch.tensor([
         [ 0,  0,  0],    # depot (0)
-        [-3, -2,  2],    # node 1
-        [-2,  4,  0],    # node 2
-        [ 2, -3,  2],    # node 3
-        [ 4, -2, -2],    # node 4
-        [ 0,  1, -1],    # node 5
-        [-1,  2, -1]     # node 6 (추가)
+        [-300, -200,  200],    # node 1
+        [-200,  400,  0],    # node 2
+        [ 200, -300,  200],    # node 3
+        [ 400, -200, -200],    # node 4
+        [ 0,  100, -100],    # node 5
+        [-100,  200, -100]     # node 6 (추가)
     ], dtype=torch.int32)
 
     dist_matrix = np.array([
@@ -38,9 +38,9 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
         [2.0, 1.7, 0.9, 1.4, 0.0, 1.3, 1.5],
         [1.9, 2.1, 1.8, 2.0, 1.3, 0.0, 1.2],
         [2.2, 1.9, 2.3, 2.2, 1.5, 1.2, 0.0]
-    ])
+    ]) * 1000.0 
     item_to_group = [0, 0, 1]
-    group_cap = {0: 4, 1: 2}
+    group_cap = {0: 400, 1: 200}
 
     # -------------------------------
     # 2. 환경 클래스 정의
@@ -71,9 +71,14 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
             self.group_cap = group_cap
             self.num_nodes = fixed_net_demand.shape[0]
             self.num_items = fixed_net_demand.shape[1]
-            self.max_steps = 3000
-            max_amount = max(group_cap.values())
-            self.action_space = MultiDiscrete([self.num_nodes, self.num_items, 2, max_amount + 1])
+            self.max_steps = 10000
+            self.ratio_levels = 10  # 0%, 5%, ..., 100% → 수량 비율 표현
+            self.action_space = MultiDiscrete([
+                self.num_nodes,        # 노드
+                self.num_items,        # 품목
+                2,                     # 작업 타입: 0=픽업, 1=배송
+                self.ratio_levels      # 수량 비율 인덱스
+            ])
 
             # 그룹별 아이템 마스크 생성
             self.group_masks = []
@@ -128,6 +133,7 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
             self.vehicle_capacity = torch.zeros(self.num_items, dtype=torch.int32)
             self.vehicle_pos = 0
             self.step_count = 0
+            self.initial_unbalance = max(self._get_total_unbalance(), 1e-6)
             return self._get_obs(), {}
         
         def _get_obs(self):
@@ -198,22 +204,39 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
         
         def step(self, action):
             prev_unbalance = self._get_total_unbalance()
-            node, item, task_type, amount = map(int, action.tolist())
+            
+            # 행동 해석: node, item, task_type, ratio_index
+            node, item, task_type, ratio_idx = map(int, action.tolist())
+            ratio = (ratio_idx + 1) / (self.ratio_levels)  # 0~1 사이 수량 비율
+
+            # 거리 및 위치 업데이트
             dist = self.dist_matrix[self.vehicle_pos, node].item()
             self.vehicle_pos = node
             self.step_count += 1
+
+            # 현재 상태값
             net = self.net_demand[node, item].item()
             cap = self.vehicle_capacity[item].item()
-            amt = int(amount)
-
-            # 그룹 사용량 계산 (벡터화)
             group_id = self.item_to_group[item].item()
             group_mask = self.group_masks[group_id]
             group_used = torch.sum(self.vehicle_capacity[group_mask]).item()
             group_limit = self.group_cap[group_id]
+
+            # 최대 가능 수량
+            if task_type == 0:  # 픽업
+                max_amt = min(net, group_limit - group_used)
+            else:  # 배송
+                max_amt = min(-net, cap)
+            
+            max_amt = max(0, max_amt)  # 음수 방지
+
+            # 비율 기반 수량 계산 (float → int 절삭)
+            amt = int(ratio * max_amt)
+
             pickup = 0
             delivery = 0
-            reward = -dist - 0.5
+            max_dist = self.dist_matrix.max().item()
+            reward = -(dist / max_dist) * 1.0
 
             if node != 0:
                 if task_type == 0:  # 픽업
@@ -222,7 +245,7 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
                         self.net_demand[node, item] -= amt
                         self.vehicle_capacity[item] += amt
                     else:
-                        reward -= 3.0  # 잘못된 픽업
+                        reward -= 10.0  # 잘못된 픽업
 
                 elif task_type == 1:  # 배송
                     if -net >= amt and cap >= amt:
@@ -230,17 +253,17 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
                         self.net_demand[node, item] += amt
                         self.vehicle_capacity[item] -= amt
                     else:
-                        reward -= 3.0  # 잘못된 배송
+                        reward -= 10.0  # 잘못된 배송
 
             new_unbalance = self._get_total_unbalance()
-            reward += (prev_unbalance - new_unbalance) * 3
-
-            # 종료 조건 체크 (모든 노드의 불균형이 해소되고 차량이 depot에 있는 경우)
+            delta = prev_unbalance - new_unbalance
+            reward += (delta / self.initial_unbalance) * 10.0
+            reward -= 1
             terminated = bool(torch.all(self.net_demand[1:] == 0)) and self.vehicle_pos == 0
             truncated = self.step_count >= self.max_steps
 
             if terminated:
-                reward += 8000.0
+                reward += 100.0
 
             return self._get_obs(), reward, terminated, truncated, {
                 "pickup": pickup,
@@ -249,6 +272,7 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
                 "action": [node, item, task_type, amt],
                 "dist": dist
             }
+
 
     # ---------------
     # 2. 병렬환경 구성
@@ -276,9 +300,9 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
     model = PPO(
         "MlpPolicy",
         train_env,
-        policy_kwargs={"net_arch": [512, 512, 512, 512, 512]},
+        policy_kwargs={"net_arch": [512] * 10},
         verbose=1,
-        n_epochs=20,
+        n_epochs=10,
         device = 'cpu'
     )
     
@@ -313,7 +337,7 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
     total_dist = 0.0
 
     # 위에서 저장한 모델(병렬환경에서 학습된 모델)을 불러옴
-    model = PPO.load("ppo_vrp_model/vrp_info.zip", device="cpu")
+    model = PPO.load("ppo_vrp_model/best_model.zip", device="cpu")
 
     while not done:
         action, _ = model.predict(obs, deterministic=True)
