@@ -20,6 +20,8 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
     import torch
     import numpy as np
 
+    UNIT = 50
+
     fixed_net_demand = torch.tensor([
         [ 0,  0,  0],    # depot (0)
         [-300, -200,  200],    # node 1
@@ -30,6 +32,8 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
         [-100,  200, -100]     # node 6 (추가)
     ], dtype=torch.int32)
 
+    fixed_net_demand = fixed_net_demand / UNIT  # 단위 변환
+    
     dist_matrix = np.array([
         [0.0, 1.2, 2.5, 1.8, 2.0, 1.9, 2.2],
         [1.2, 0.0, 1.3, 1.5, 1.7, 2.1, 1.9],
@@ -41,6 +45,9 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
     ]) * 1000.0 
     item_to_group = [0, 0, 1]
     group_cap = {0: 400, 1: 200}
+    group_cap = {g: cap // UNIT for g, cap in group_cap.items()}  # 단위 변환
+
+
 
     # -------------------------------
     # 2. 환경 클래스 정의
@@ -72,12 +79,13 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
             self.num_nodes = fixed_net_demand.shape[0]
             self.num_items = fixed_net_demand.shape[1]
             self.max_steps = 10000
-            self.ratio_levels = 10  # 0%, 5%, ..., 100% → 수량 비율 표현
+            MAX_QTY = max(group_cap.values())  # 예: 400 -> UNIT=50 기준으로 8
+            self.max_quantity_unit = MAX_QTY
             self.action_space = MultiDiscrete([
-                self.num_nodes,        # 노드
-                self.num_items,        # 품목
-                2,                     # 작업 타입: 0=픽업, 1=배송
-                self.ratio_levels      # 수량 비율 인덱스
+                self.num_nodes,
+                self.num_items,
+                2,                         # 작업 타입
+                self.max_quantity_unit + 1  # 수량 단위 (0 ~ 8)
             ])
 
             # 그룹별 아이템 마스크 생성
@@ -206,8 +214,8 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
             prev_unbalance = self._get_total_unbalance()
             
             # 행동 해석: node, item, task_type, ratio_index
-            node, item, task_type, ratio_idx = map(int, action.tolist())
-            ratio = (ratio_idx + 1) / (self.ratio_levels)  # 0~1 사이 수량 비율
+            node, item, task_type, amt_unit = map(int, action.tolist())
+            amt = amt_unit
 
             # 거리 및 위치 업데이트
             dist = self.dist_matrix[self.vehicle_pos, node].item()
@@ -230,13 +238,10 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
             
             max_amt = max(0, max_amt)  # 음수 방지
 
-            # 비율 기반 수량 계산 (float → int 절삭)
-            amt = int(ratio * max_amt)
-
             pickup = 0
             delivery = 0
             max_dist = self.dist_matrix.max().item()
-            reward = -(dist / max_dist) * 1.0
+            reward = -(dist / max_dist) * 1.0 
 
             if node != 0:
                 if task_type == 0:  # 픽업
@@ -245,7 +250,7 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
                         self.net_demand[node, item] -= amt
                         self.vehicle_capacity[item] += amt
                     else:
-                        reward -= 10.0  # 잘못된 픽업
+                        reward -= 1.0  # 잘못된 픽업
 
                 elif task_type == 1:  # 배송
                     if -net >= amt and cap >= amt:
@@ -253,17 +258,17 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
                         self.net_demand[node, item] += amt
                         self.vehicle_capacity[item] -= amt
                     else:
-                        reward -= 10.0  # 잘못된 배송
+                        reward -= 1.0  # 잘못된 배송
 
             new_unbalance = self._get_total_unbalance()
             delta = prev_unbalance - new_unbalance
             reward += (delta / self.initial_unbalance) * 10.0
-            reward -= 1
+            reward -= 5
             terminated = bool(torch.all(self.net_demand[1:] == 0)) and self.vehicle_pos == 0
             truncated = self.step_count >= self.max_steps
 
             if terminated:
-                reward += 100.0
+                reward += 8000.0
 
             return self._get_obs(), reward, terminated, truncated, {
                 "pickup": pickup,
@@ -300,10 +305,12 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
     model = PPO(
         "MlpPolicy",
         train_env,
-        policy_kwargs={"net_arch": [512] * 10},
+        policy_kwargs={"net_arch": [512] * 11},
         verbose=1,
-        n_epochs=10,
-        device = 'cpu'
+        n_epochs=20,
+        device = 'cpu',
+        learning_rate=1e-4,
+        batch_size=64,
     )
     
     eval_callback = EvalCallback(
@@ -315,7 +322,7 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
     render=False
     )
 
-    model.learn(total_timesteps=1000000, 
+    model.learn(total_timesteps=2000000, 
             callback=eval_callback
             )
     
@@ -381,11 +388,6 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
     plt.axis("equal")
     plt.tight_layout()
     plt.show()
-
-
-
-
-
 
 
 
