@@ -78,7 +78,7 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
             self.group_cap = group_cap
             self.num_nodes = fixed_net_demand.shape[0]
             self.num_items = fixed_net_demand.shape[1]
-            self.max_steps = 10000
+            self.max_steps = 300
             MAX_QTY = max(group_cap.values())  # 예: 400 -> UNIT=50 기준으로 8
             self.max_quantity_unit = MAX_QTY
             self.action_space = MultiDiscrete([
@@ -241,7 +241,7 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
             pickup = 0
             delivery = 0
             max_dist = self.dist_matrix.max().item()
-            reward = -(dist / max_dist) * 1.0 
+            reward = -(dist / max_dist) * 10.0 
 
             if node != 0:
                 if task_type == 0:  # 픽업
@@ -262,13 +262,13 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
 
             new_unbalance = self._get_total_unbalance()
             delta = prev_unbalance - new_unbalance
-            reward += (delta / self.initial_unbalance) * 10.0
+            reward += (delta / self.initial_unbalance) * 100.0
             reward -= 5
             terminated = bool(torch.all(self.net_demand[1:] == 0)) and self.vehicle_pos == 0
             truncated = self.step_count >= self.max_steps
 
             if terminated:
-                reward += 8000.0
+                reward += 10.0
 
             return self._get_obs(), reward, terminated, truncated, {
                 "pickup": pickup,
@@ -295,7 +295,7 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
 
     # range 내 숫자 = 사용할 cpu 코어 갯수
     # 사용하고자 하는 코어 갯수만큼 환경을 생성하여 병렬 학습
-    train_env = SubprocVecEnv([make_env() for _ in range(4)])
+    train_env = SubprocVecEnv([make_env() for _ in range(8)])
 
     # -------------------------------
     # 3. 병렬환경에서 학습
@@ -305,7 +305,7 @@ if __name__ == "__main__": # 해당 코드가 구현된 파일이 직접 실행�
     model = PPO(
         "MlpPolicy",
         train_env,
-        policy_kwargs={"net_arch": [512] * 11},
+        policy_kwargs={"net_arch": [512] * 6},
         verbose=1,
         n_epochs=20,
         device = 'cpu',
