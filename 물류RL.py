@@ -256,7 +256,7 @@ class VRPEnv(gym.Env):
         delta = prev_unbalance - new_unbalance # 새로운 상태의 불균형을 계산
         if self.initial_unbalance > 0: # 초기 불균형이 0보다 큰 경우
             reward += (delta / self.initial_unbalance) * progress_reward # 초기 불균형 대비 변화량에 따라 보상을 조정
-        reward -= self.step_count * step_penalty # 매 스텝마다 일정한 감소 보상 적용(스텝을 최대한 간소화 하기 위해)
+        reward -= step_penalty # 매 스텝마다 일정한 감소 보상 적용(스텝을 최대한 간소화 하기 위해)
 
         terminated = bool(torch.all(self.net_demand[1:] == 0)) and self.vehicle_pos == 0 # 모든 노드의 순수 수요가 0이고(작업을 모두 완료) 차량 위치가 0(차고)인 경우(차고지 복귀) 환경을 종료
         truncated = self.step_count >= self.max_steps # 최대 스텝 수에 도달한 경우 환경을 중단
