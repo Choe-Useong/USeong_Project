@@ -1,5 +1,38 @@
 import numpy as np
 import pandas as pd
+import torch
+from stable_baselines3 import PPO
+from stable_baselines3.common.env_util import make_vec_env
+from imitation.algorithms.bc import BC
+from imitation.data.types import Transitions
+from vrp_env import VRPEnv  # ← 당신의 VRP 환경
+
+
+# 테스트 실행 예시
+fixed_net_demand = np.array([
+    [   0,    0,    0],
+    [-300, -200,  200], #1
+    [-200,  400,    0], #2
+    [ 200, -300,  200], #3
+    [ 400, -200, -200], #4
+    [   0,  100, -100], #5
+    [-100,  200, -100]  #6
+])
+
+fixed_net_demand = fixed_net_demand  # 단위 변환
+
+
+dist_matrix = np.array([
+    [0.0,1.2,2.5,1.8,2.0,1.9,2.2],
+    [1.2,0.0,1.3,1.5,1.7,2.1,1.9],
+    [2.5,1.3,0.0,1.1,0.9,1.8,2.3],
+    [1.8,1.5,1.1,0.0,1.4,2.0,2.2],
+    [2.0,1.7,0.9,1.4,0.0,1.3,1.5],
+    [1.9,2.1,1.8,2.0,1.3,0.0,1.2],
+    [2.2,1.9,2.3,2.2,1.5,1.2,0.0]
+])
+item_to_group = [0, 0, 1]
+group_cap = {0: 400, 1: 200}
 
 def greedy_balanced_route(dist_matrix, net_demand, item_to_group, group_cap, depot=0):
     N, K = net_demand.shape
@@ -70,34 +103,7 @@ def greedy_balanced_route(dist_matrix, net_demand, item_to_group, group_cap, dep
     df_route = pd.DataFrame(route, columns=["Node", "Item", "SignedQty", "ΔU", "Distance", "Score"])
     return df_route, total_dist, total_reduction
 
-UNIT = 50  # 단위 변환을 위한 상수 (예: 50개 단위)
 
-# 테스트 실행 예시
-fixed_net_demand = np.array([
-    [   0,    0,    0],
-    [-300, -200,  200], #1
-    [-200,  400,    0], #2
-    [ 200, -300,  200], #3
-    [ 400, -200, -200], #4
-    [   0,  100, -100], #5
-    [-100,  200, -100]  #6
-])
-
-fixed_net_demand = fixed_net_demand / UNIT  # 단위 변환
-
-
-dist_matrix = np.array([
-    [0.0,1.2,2.5,1.8,2.0,1.9,2.2],
-    [1.2,0.0,1.3,1.5,1.7,2.1,1.9],
-    [2.5,1.3,0.0,1.1,0.9,1.8,2.3],
-    [1.8,1.5,1.1,0.0,1.4,2.0,2.2],
-    [2.0,1.7,0.9,1.4,0.0,1.3,1.5],
-    [1.9,2.1,1.8,2.0,1.3,0.0,1.2],
-    [2.2,1.9,2.3,2.2,1.5,1.2,0.0]
-]) * 1000
-item_to_group = [0, 0, 1]
-group_cap = {0: 400, 1: 200}
-group_cap = {g: cap // UNIT for g, cap in group_cap.items()}  # 단위 변환
 
 df_route, total_dist, total_reduction = greedy_balanced_route(
     dist_matrix, fixed_net_demand, item_to_group, group_cap
@@ -136,54 +142,3 @@ for step, row in df_route.iterrows():
     print(f"Step {step + 1}: 노드 {node}, 품목 {item}, 작업 {task}, 수량 {abs_qty} → "
           f"배송 {0 if qty < 0 else abs_qty}, 픽업 {abs_qty if qty < 0 else 0}, "
           f"적재 {load_by_item}, 이동거리 {dist:.2f}, 누적거리 {cumulative_dist:.2f}")
-
-
-
-
-
-import torch
-from vrp_env import VRPEnv
-
-obs_list = []
-action_list = []
-
-env = VRPEnv(
-    fixed_net_demand=torch.tensor(fixed_net_demand),
-    dist_matrix=dist_matrix,
-    item_to_group=item_to_group,
-    group_cap=group_cap
-)
-obs, _ = env.reset()
-
-# 수량 추적용
-load_by_item = [0] * fixed_net_demand.shape[1]
-UNIT = 50  # 환경에 정의된 UNIT과 반드시 일치해야 함
-
-for step, row in df_route.iterrows():
-    node = int(row["Node"])
-    item = int(row["Item"])
-    signed_q = int(row["SignedQty"])
-
-    # depot 복귀 스텝은 무시
-    if signed_q == 0 and node == 0:
-        break
-
-    task_type = 0 if signed_q < 0 else 1
-    abs_q = abs(signed_q)
-
-    # 수량 단위로 변환 (예: 100 → 2 if UNIT=50)
-    amt_unit = abs_q 
-    if amt_unit == 0:
-        continue  # 무의미한 행동
-
-    # 행동 정의 및 저장
-    action = torch.tensor([node, item, task_type, amt_unit])
-    action_list.append(action)
-    obs_list.append(obs)
-
-    # 환경 실행 및 적재량 업데이트
-    obs, _, done, _, info = env.step(action)
-    load_by_item = info["cap"]
-
-    if done:
-        break
