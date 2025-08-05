@@ -26,10 +26,6 @@ for group_name, paths in merge_groups.items():
 
 print(f"\n🎉 병합 저장 완료: {gpkg_path}")
 
-# 🔍 저장된 GeoPackage에서 레이어 불러오기
-layers = gpd.io.file.fiona.listlayers(gpkg_path)
-print(f"\n📚 GeoPackage 레이어 목록: {layers}")
-
 # 노드 및 링크 레이어 불러오기
 gdf_nodes = gpd.read_file(gpkg_path, layer='nodes')
 gdf_links = gpd.read_file(gpkg_path, layer='links')
@@ -39,6 +35,19 @@ from shapely.geometry import LineString
 
 # NF_ID → geometry 매핑
 id_to_geom = dict(zip(gdf_nodes['NF_ID'], gdf_nodes.geometry))
+
+# NF_ID → geometry 매핑
+id_to_geom = dict(zip(gdf_nodes['NF_ID'], gdf_nodes.geometry))
+
+# ✅ NF_ID → 법정동코드(앞 5자리) 매핑
+id_to_leglcd = {}
+for _, row in gdf_nodes.iterrows():
+    code = None
+    if pd.notnull(row.get("LEGLCD_SE1")):
+        code = row["LEGLCD_SE1"]
+    elif pd.notnull(row.get("LEGLCD_SE2")):
+        code = row["LEGLCD_SE2"]
+    id_to_leglcd[row['NF_ID']] = code
 
 # 기존 링크의 컬럼 구조 확보
 link_columns = gdf_links.columns
@@ -52,19 +61,21 @@ for _, row in gdf_nodes.iterrows():
     if pd.notnull(tgt) and tgt in id_to_geom:
         try:
             geom = LineString([id_to_geom[src], id_to_geom[tgt]])
+            leglcd = id_to_leglcd.get(src) or id_to_leglcd.get(tgt)
             virtual_links.append({
                 'NF_ID': f'{src}_to_{tgt}',
                 'BNODE_NFID': src,
                 'ENODE_NFID': tgt,
                 'geometry': geom,
-                'RDLINK_SE': 'ADJ',         # 가상도로 식별자
-                'OSPS_SE': 'OWI002',        # 양방향 연결 허용
+                'RDLINK_SE': 'ADJ',
+                'OSPS_SE': 'OWI002',
                 'ROAD_NO': 'adj_link',
-                'TFCEQP_SE': '00'
-                # ➕ 필요한 경우 다른 필드 추가 가능
+                'TFCEQP_SE': '00',
+                'LEGLCD_SE': leglcd  # ✅ 여기 추가
             })
         except Exception as e:
             print(f"❌ 가상도로 생성 실패: {src} → {tgt}, 이유: {e}")
+
 
 # GeoDataFrame으로 변환
 gdf_virtual_links = gpd.GeoDataFrame(virtual_links, crs=gdf_nodes.crs)
@@ -84,6 +95,5 @@ print(f"💾 'links_with_adj' 레이어 저장 완료 ({len(gdf_links_with_virtu
 
 print(f"✅ nodes 레이어 불러오기 완료 ({len(gdf_nodes)} 행)")
 print(f"✅ links 레이어 불러오기 완료 ({len(gdf_links)} 행)")
-
 
 
