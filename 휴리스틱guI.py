@@ -66,12 +66,21 @@ def run_partitioning(nodes, items, demand, vehicles, capacity, start_node, dist,
                             prob += ratio[i][itm][k] == 0
 
     # 목적함수: 편차 + 거리
+    # 거리 정규화를 위해 최대 거리 값 계산
+    max_dist_val = max(dist.values()) if dist else 1.0 # dist가 비어있을 경우 1.0으로 나눔
+    if max_dist_val == 0: # 모든 거리가 0일 경우 (동일 노드만 있거나)
+        max_dist_val = 1.0
+
     total_dist = pulp.lpSum([
         ratio[i][itm][k] * abs(demand[i][itm]) * dist.get((start_node[k], i), 1e6)
         for i in nodes for itm in items for k in vehicles
     ])
-    alpha, beta = 1, 1
-    prob += alpha * pulp.lpSum([deviation[k] for k in vehicles]) + beta * total_dist
+    
+    # 정규화된 거리 항
+    normalized_total_dist = total_dist / max_dist_val
+
+    alpha, beta = 1, 1 # alpha와 beta는 그대로 1로 유지하여 정규화된 두 항의 중요도를 동일하게 설정
+    prob += alpha * pulp.lpSum([deviation[k] for k in vehicles]) + beta * normalized_total_dist
 
     prob.solve()
 
@@ -848,7 +857,7 @@ def calculate_routes_from_partition(config, df_input, dist_mat, snap_nodes, depo
             for item_idx, item in enumerate(ITEM_COLS):
                 row = vdf[(vdf['노드']==idx)&(vdf['품목']==item)]
                 if not row.empty:
-                    v_net_dem[idx, item_idx] = row['물량'].sum()
+                    v_net_dem[idx, item_idx] = row['물량_int'].sum()
         
         v_start_addr = vinfo.get('start_addr', START_ADDRESS)
         try:
